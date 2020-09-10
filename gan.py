@@ -14,6 +14,19 @@ import numpy as np
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras import activations
+from PIL import Image
+
+
+# TODO: label smoothing broke these; they are still wrong
+def accuracy_op(logits, y_smooth):
+    y_hat = logits > 0
+    y = y_smooth > 0.5
+    indicators = y_hat == y
+    return tf.reduce_mean(tf.cast(indicators, tf.float32))
+
+
+def SaveAsGIF(images, path):
+    images[0].save(path, save_all=True, append_images=images[1:], duration=100, loop=0)
 
 
 class DCGAN(tf.keras.Model):
@@ -39,34 +52,45 @@ class DCGAN(tf.keras.Model):
 
     def find_nice_latent_vectors(self, num_nice_vectors, num_search_vectors):
         assert num_nice_vectors <= num_search_vectors
-        z = tf.random.noraml(shape(num_search_vectors, self.latent_dim))
+        z = tf.random.normal(shape=(num_search_vectors, self.latent_dim))
+        print(z.shape)
         generated_images = self.generator(z)
         predictions = self.discriminator(generated_images)
-        predictions.numpy()
-        nice_order = np.argsort(predictions)
+        nice_order = tf.argsort(predictions, direction="ASCENDING", axis=0)
         nicest_indices = nice_order[:num_nice_vectors]
-        return z[nicest_indices, :]
+        print(z)
+        print(type(nicest_indices))
+        print(z.shape)
+        print(nicest_indices)
+        print(nicest_indices.shape)
+        return tf.gather(z, nicest_indices)
 
     def _build_generator(self):
         self.generator = keras.Sequential(
             [
                 keras.Input(shape=(self.latent_dim,)),
                 layers.Dense(7 * 7 * 128),
+                # layers.BatchNormalization(),
                 layers.LeakyReLU(alpha=0.2),
+                # layers.ReLU(),
                 layers.Reshape((7, 7, 128)),
                 # Upsample: 7x7 -> 14x14.
                 layers.Conv2DTranspose(128, (5, 5), strides=(2, 2), padding="same"),
+                # layers.BatchNormalization(),
+                # layers.ReLU(),
                 layers.LeakyReLU(alpha=0.2),
                 # Upsample: 14x14 -> 28x28
                 layers.Conv2DTranspose(64, (5, 5), strides=(2, 2), padding="same"),
+                # layers.BatchNormalization(),
                 layers.LeakyReLU(alpha=0.2),
+                # layers.ReLU(),
                 # Reshape
                 layers.Conv2D(1, (7, 7), padding="same", activation="sigmoid"),
             ],
             name="generator",
         )
         self.generator.summary()
-        self.g_optimizer = keras.optimizers.Adam(learning_rate=3e-4)
+        self.g_optimizer = keras.optimizers.Adam(learning_rate=2e-4, beta_1=0.5)
 
     def _build_discriminator(self):
         self.discriminator = keras.Sequential(
@@ -85,7 +109,7 @@ class DCGAN(tf.keras.Model):
             name="discriminator",
         )
         self.discriminator.summary()
-        self.d_optimizer = keras.optimizers.Adam(learning_rate=3e-4)
+        self.d_optimizer = keras.optimizers.Adam(learning_rate=2e-4, beta_1=0.5)
         self.loss_fn = keras.losses.BinaryCrossentropy(from_logits=True)
 
     def _train_step_generator(self, batch_size):
@@ -98,33 +122,62 @@ class DCGAN(tf.keras.Model):
         self.g_optimizer.apply_gradients(zip(g_grads, self.generator.trainable_weights))
         return loss
 
-    def _train_step_discriminator(self, real_images):
-        batch_size = tf.shape(real_images)[0]
-        # Generate images.
-        z = tf.random.normal(shape=(batch_size, self.latent_dim))
-        generated_images = self.generator(z)
-        # Combine the generated and real images.
-        combined_images = tf.concat([generated_images, real_images], axis=0)
-        combined_labels = tf.concat(
-            [tf.ones((batch_size, 1)), tf.zeros((batch_size, 1))], axis=0
-        )
-        # Add random noise to the labels -- important trick!
-        # TODO(seanrafferty): why?
-        combined_labels += 0.05 * tf.random.uniform(tf.shape(combined_labels))
+    def _train_step_discriminator_internal(self, images, labels):
         with tf.GradientTape() as tape:
-            predictions = self.discriminator(combined_images)
-            loss = self.loss_fn(combined_labels, predictions)
+            predictions = self.discriminator(images)
+            loss = self.loss_fn(labels, predictions)
         d_grads = tape.gradient(loss, self.discriminator.trainable_weights)
         self.d_optimizer.apply_gradients(
             zip(d_grads, self.discriminator.trainable_weights)
         )
-        return loss
+        acc = accuracy_op(predictions, labels)
+        return loss, acc
+
+    def _train_step_discriminator_generated(self, batch_size):
+        z = tf.random.normal(shape=(batch_size, self.latent_dim))
+        generated_images = self.generator(z)
+        # Positive labels smoothing, Uniform [0.7, 1.2].
+        labels = tf.random.uniform(shape=(batch_size, 1), minval=0.7, maxval=1.2)
+        return self._train_step_discriminator_internal(generated_images, labels)
+
+    def _train_step_discriminator_real(self, real_images):
+        batch_size = tf.shape(real_images)[0]
+        labels = tf.zeros((batch_size, 1))
+        # Negative label smoothing Uniform, [0.0, 0.3].
+        labels = tf.random.uniform(shape=(batch_size, 1), minval=0.0, maxval=0.3)
+        return self._train_step_discriminator_internal(real_images, labels)
+
+    def _train_step_discriminator(self, real_images):
+        batch_size = tf.shape(real_images)[0]
+        d_loss_g, d_acc_g = self._train_step_discriminator_generated(batch_size)
+        d_loss_r, d_acc_r = self._train_step_discriminator_real(real_images)
+        d_loss = (d_loss_g + d_loss_r) / 2.0
+        return d_loss_g, d_loss_r, d_acc_g, d_acc_r
 
     def train_step(self, real_images):
         batch_size = tf.shape(real_images)[0]
-        d_loss = self._train_step_discriminator(real_images)
+        d_loss_g, d_loss_r, d_acc_g, d_acc_r = self._train_step_discriminator(
+            real_images
+        )
         g_loss = self._train_step_generator(batch_size)
-        return {"d_loss": d_loss, "g_loss": g_loss}
+        return {
+            "g_loss": g_loss,
+            "d_loss_g": d_loss_g,
+            "d_loss_r": d_loss_r,
+            "d_acc_g": d_acc_g,
+            "d_acc_r": d_acc_r,
+        }
+
+    def generate_and_save_images(self, z, path):
+        generated_images = self.generator(z)
+        generated_images *= 255
+        generated_images.numpy()
+        imgs = []
+        for i in range(z.shape[0]):
+            img = keras.preprocessing.image.array_to_img(generated_images[i])
+            # img.save(path.format(i=i))
+            imgs.append(img)
+        SaveAsGIF(imgs, "interp.gif")
 
 
 class DCGANMonitor(keras.callbacks.Callback):
@@ -163,30 +216,48 @@ if __name__ == "__main__":
 
     mnist = prepare_mnist()
 
-    # Save the most recent weights as a canonical place to load from.
     most_recent_ckpt_path = "training/saved-model-most-recent.ckpt"
-    ckpt_cb_most_recent = keras.callbacks.ModelCheckpoint(
-        filepath=most_recent_ckpt_path,
-        save_weights_only=True,
-        verbose=1,
-    )
-
-    # Save weights after each epoc so we can see how the model evolves.
-    ckpt_cb_each_epoch = keras.callbacks.ModelCheckpoint(
-        filepath="training/saved-model-{epoch:02d}.ckpt",
-        save_weights_only=True,
-        verbose=1,
-    )
 
     load_weights = False
     if load_weights:
         dcgan.load_weights(most_recent_ckpt_path)
 
-    dcgan_monitor_callback = DCGANMonitor(num_img=3, latent_dim=latent_dim)
+    if False:
+        z_nice = dcgan.find_nice_latent_vectors(
+            num_nice_vectors=10, num_search_vectors=2000
+        )
+        a = z_nice[0, :]
+        b = z_nice[1, :]
 
-    epochs = 30
+        num_interp = 20
+        a_to_b = np.zeros(shape=(num_interp, latent_dim))
+        for i in range(num_interp):
+            p = i / (num_interp - 1)
+            a_to_b[i, :] = a + p * (b - a)
+        b_to_a = np.flipud(a_to_b)
+        interp_loop = np.vstack([a_to_b, b_to_a])
+        dcgan.generate_and_save_images(interp_loop, "interp{i:03d}.png")
+
     train = True
     if train:
+        epochs = 30
+
+        # Save the most recent weights as a canonical place to load from.
+        ckpt_cb_most_recent = keras.callbacks.ModelCheckpoint(
+            filepath=most_recent_ckpt_path,
+            save_weights_only=True,
+            verbose=1,
+        )
+
+        # Save weights after each epoc so we can see how the model evolves.
+        ckpt_cb_each_epoch = keras.callbacks.ModelCheckpoint(
+            filepath="training/saved-model-{epoch:02d}.ckpt",
+            save_weights_only=True,
+            verbose=1,
+        )
+
+        dcgan_monitor_callback = DCGANMonitor(num_img=3, latent_dim=latent_dim)
+
         dcgan.fit(
             mnist,
             epochs=epochs,
