@@ -55,6 +55,25 @@ def SaveAsGIF(images, path):
     images[0].save(path, save_all=True, append_images=images[1:], duration=100, loop=0)
 
 
+# https://arxiv.org/pdf/1606.03498.pdf
+class MinibatchDiscriminization(keras.layer.Layer):
+    def __init__(self, B, C):
+        super(MinibatchDiscrimination, self).__init__()
+        self.B = B
+        self.C = C
+
+    def build(self input_shape):
+        A = input_shape[-1]
+        # features [n, F]
+        # tensor [F, B, C]
+        # features * tensor [n, B, C]
+        self.T = tf.Variable(shape=(A, B, C))
+    
+    def call(self, inputs):
+        M = inputs.dot(self.T)
+        # TODO: finish this
+
+
 class DCGAN(tf.keras.Model):
     def __init__(self, latent_dim, num_classes):
         super(DCGAN, self).__init__()
@@ -177,6 +196,8 @@ class DCGAN(tf.keras.Model):
         z = tf.random.normal(shape=(batch_size, self.latent_dim))
         with tf.GradientTape() as tape:
             outputs = self.discriminator(self.generator(z))
+
+            # Deception loss. Currently ignored.
             predictions = outputs["d_predictions"]
             predictions_generated = tf.gather(
                 predictions, indices=[self.num_classes], axis=1
@@ -185,8 +206,15 @@ class DCGAN(tf.keras.Model):
             deception_loss = keras.losses.BinaryCrossentropy(from_logits=True)(
                 misleading_labels, predictions_generated
             )
-            # TODO(seanrafferty): Add feature matching loss.
-        g_grads = tape.gradient(deception_loss, self.generator.trainable_weights)
+
+            # Feature matching loss.
+            mean_real_features = tf.reduce_mean(real_features, axis=0)
+            mean_gen_features = tf.reduce_mean(outputs["d_features"], axis=0)
+            feature_matching_loss = keras.losses.MeanSquaredError()(
+                    mean_real_features, mean_gen_features
+            )
+        loss = feature_matching_loss
+        g_grads = tape.gradient(loss, self.generator.trainable_weights)
         self.g_optimizer.apply_gradients(zip(g_grads, self.generator.trainable_weights))
         return deception_loss
 
