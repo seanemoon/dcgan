@@ -16,6 +16,7 @@ import os
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras import activations
+from tensorflow.keras import backend as K
 from PIL import Image
 
 
@@ -54,24 +55,44 @@ def noisy_labels(y, p=0.05):
 def SaveAsGIF(images, path):
     images[0].save(path, save_all=True, append_images=images[1:], duration=100, loop=0)
 
+# [n, A]
+# [A, B, C]
+# 
+
 
 # https://arxiv.org/pdf/1606.03498.pdf
-class MinibatchDiscriminization(keras.layer.Layer):
-    def __init__(self, B, C):
-        super(MinibatchDiscrimination, self).__init__()
+class MinibatchDiscrimination(keras.layers.Layer):
+    def __init__(self, B, C, **kwargs):
+        super(MinibatchDiscrimination, self).__init__(**kwargs)
         self.B = B
         self.C = C
 
-    def build(self input_shape):
+    def build(self, input_shape):
         A = input_shape[-1]
-        # features [n, F]
-        # tensor [F, B, C]
-        # features * tensor [n, B, C]
-        self.T = tf.Variable(shape=(A, B, C))
-    
-    def call(self, inputs):
-        M = inputs.dot(self.T)
-        # TODO: finish this
+        print("input_shape", input_shape)
+        self.T = self.add_weight(name="T",
+            shape=(A, self.B, self.C), initializer="random_normal", trainable=True
+        )
+        print("T.shape", tf.shape(self.T))
+
+    def call(self, x):
+        # x [n, A]
+        # T [A, B, C]
+        # M [n, B, C]
+        M = tf.tensordot(x, self.T, axes=[[1], [0]])
+        # M1 [n, B, C, 1]
+        M1 = K.expand_dims(M, 3)
+        # M2 [1, B, C, n]
+        M2 = K.permute_dimensions(M1, [3, 1, 2, 0])
+        diffs = M1 - M2
+        # Sum over the features in each vector
+        # [n, B, C, n] -> [n, B, n].
+        l1 = K.sum(K.abs(diffs), axis=2)
+        c = K.exp(-l1)
+        # Sum over each sample in the minibatch
+        # [n, B, n] -> [n, B].
+        o = K.sum(c, axis=2)
+        return K.concatenate([x, o], 1)
 
 
 class DCGAN(tf.keras.Model):
@@ -103,16 +124,13 @@ class DCGAN(tf.keras.Model):
     def find_nice_latent_vectors(self, num_nice_vectors, num_search_vectors):
         assert num_nice_vectors <= num_search_vectors
         z = tf.random.normal(shape=(num_search_vectors, self.latent_dim))
-        print(z.shape)
         generated_images = self.generator(z)
-        predictions = self.discriminator(generated_images)
-        nice_order = tf.argsort(predictions, direction="ASCENDING", axis=0)
+        outputs = self.discriminator(generated_images)
+        predictions = outputs["d_predictions"]
+        fake_score = predictions[:, -1]
+        score_6 = predictions[:, 6]
+        nice_order = tf.argsort(fake_score, direction="ASCENDING", axis=0)
         nicest_indices = nice_order[:num_nice_vectors]
-        print(z)
-        print(type(nicest_indices))
-        print(z.shape)
-        print(nicest_indices)
-        print(nicest_indices.shape)
         return tf.gather(z, nicest_indices)
 
     def _build_generator(self):
@@ -150,9 +168,9 @@ class DCGAN(tf.keras.Model):
         x = layers.BatchNormalization()(x)
         x = layers.LeakyReLU(alpha=0.2)(x)
         self.d_features = layers.Flatten()(x)
-        print("features shape: ", self.d_features.shape)
+        self.d_minibatch_features = MinibatchDiscrimination(B=32, C=64)(self.d_features)
         self.d_predictions = layers.Dense(self.num_classes + 1, name="d_predictions")(
-            self.d_features
+            self.d_minibatch_features
         )
         self.discriminator = keras.Model(
             inputs=inputs,
@@ -197,7 +215,7 @@ class DCGAN(tf.keras.Model):
         with tf.GradientTape() as tape:
             outputs = self.discriminator(self.generator(z))
 
-            # Deception loss. Currently ignored.
+            # Deception loss.
             predictions = outputs["d_predictions"]
             predictions_generated = tf.gather(
                 predictions, indices=[self.num_classes], axis=1
@@ -211,9 +229,11 @@ class DCGAN(tf.keras.Model):
             mean_real_features = tf.reduce_mean(real_features, axis=0)
             mean_gen_features = tf.reduce_mean(outputs["d_features"], axis=0)
             feature_matching_loss = keras.losses.MeanSquaredError()(
-                    mean_real_features, mean_gen_features
+                mean_real_features, mean_gen_features
             )
-        loss = feature_matching_loss
+
+        # Feature matching loss is currently ignored.
+        loss = deception_loss
         g_grads = tape.gradient(loss, self.generator.trainable_weights)
         self.g_optimizer.apply_gradients(zip(g_grads, self.generator.trainable_weights))
         return deception_loss
@@ -278,7 +298,7 @@ class DCGAN(tf.keras.Model):
     def call(self, real_images):
         return self.discriminator(real_images)
 
-    def generate_and_save_images(self, z, path):
+    def generate_and_save_images(self, z, path, gif=False):
         generated_images = self.generator(z)
         generated_images += 1.0
         generated_images *= 127.5
@@ -286,9 +306,11 @@ class DCGAN(tf.keras.Model):
         imgs = []
         for i in range(z.shape[0]):
             img = keras.preprocessing.image.array_to_img(generated_images[i])
-            # img.save(path.format(i=i))
+            if not gif:
+                img.save(path.format(i=i))
             imgs.append(img)
-        SaveAsGIF(imgs, "interp.gif")
+        if gif:
+            SaveAsGIF(imgs, path)
 
 
 class DCGANMonitor(keras.callbacks.Callback):
@@ -341,27 +363,28 @@ if __name__ == "__main__":
 
     most_recent_ckpt_path = "training/saved-model-most-recent.ckpt"
 
-    load_weights = False
+    load_weights = True
     if load_weights:
         dcgan.load_weights(most_recent_ckpt_path)
 
-    if False:
-        z_nice = dcgan.find_nice_latent_vectors(
-            num_nice_vectors=10, num_search_vectors=2000
-        )
-        a = z_nice[0, :]
-        b = z_nice[1, :]
+    if True:
+        for n  in range(20):
+            z_nice = dcgan.find_nice_latent_vectors(
+                num_nice_vectors=10, num_search_vectors=500
+            )
+            a = z_nice[0, :]
+            b = z_nice[1, :]
 
-        num_interp = 20
-        a_to_b = np.zeros(shape=(num_interp, latent_dim))
-        for i in range(num_interp):
-            p = i / (num_interp - 1)
-            a_to_b[i, :] = a + p * (b - a)
-        b_to_a = np.flipud(a_to_b)
-        interp_loop = np.vstack([a_to_b, b_to_a])
-        dcgan.generate_and_save_images(interp_loop, "interp{i:03d}.png")
+            num_interp = 20
+            a_to_b = np.zeros(shape=(num_interp, latent_dim))
+            for i in range(num_interp):
+                p = i / (num_interp - 1)
+                a_to_b[i, :] = a + p * (b - a)
+            b_to_a = np.flipud(a_to_b)
+            interp_loop = np.vstack([a_to_b, b_to_a])
+            dcgan.generate_and_save_images(interp_loop, "gifs/interp{n:03d}.gif".format(n=n), gif=True)
 
-    train = True
+    train = False
     if train:
         epochs = 30
 
