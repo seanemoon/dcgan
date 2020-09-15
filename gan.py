@@ -18,6 +18,7 @@ from tensorflow.keras import layers
 from tensorflow.keras import activations
 from tensorflow.keras import backend as K
 from PIL import Image
+import cv2
 
 
 # TODO: label smoothing broke these; they are still wrong
@@ -55,9 +56,10 @@ def noisy_labels(y, p=0.05):
 def SaveAsGIF(images, path):
     images[0].save(path, save_all=True, append_images=images[1:], duration=100, loop=0)
 
+
 # [n, A]
 # [A, B, C]
-# 
+#
 
 
 # https://arxiv.org/pdf/1606.03498.pdf
@@ -70,8 +72,11 @@ class MinibatchDiscrimination(keras.layers.Layer):
     def build(self, input_shape):
         A = input_shape[-1]
         print("input_shape", input_shape)
-        self.T = self.add_weight(name="T",
-            shape=(A, self.B, self.C), initializer="random_normal", trainable=True
+        self.T = self.add_weight(
+            name="T",
+            shape=(A, self.B, self.C),
+            initializer="random_normal",
+            trainable=True,
         )
         print("T.shape", tf.shape(self.T))
 
@@ -120,6 +125,20 @@ class DCGAN(tf.keras.Model):
     def save(self, prefix):
         self.generator.save("{prefix}_generator".format(prefix=prefix))
         self.discriminator.save("{prefix}_discriminator".format(prefix=prefix))
+
+    def find_nice_latent_vectors_for_num(
+        self, num_nice_vectors, num_search_vectors, num
+    ):
+        assert num_nice_vectors <= num_search_vectors
+        assert num >= 0 and num <= 9
+        z = tf.random.normal(shape=(num_search_vectors, self.latent_dim))
+        generated_images = self.generator(z)
+        outputs = self.discriminator(generated_images)
+        predictions = outputs["d_predictions"]
+        score = predictions[:, num]
+        nice_order = tf.argsort(score, direction="DESCENDING", axis=0)
+        nicest_indices = nice_order[:num_nice_vectors]
+        return tf.gather(z, nicest_indices)
 
     def find_nice_latent_vectors(self, num_nice_vectors, num_search_vectors):
         assert num_nice_vectors <= num_search_vectors
@@ -317,7 +336,8 @@ class DCGANMonitor(keras.callbacks.Callback):
     def __init__(self, num_img=3, latent_dim=128):
         self.num_img = num_img
         self.latent_dim = latent_dim
-        shutil.rmtree("generated_images")
+        if os.path.exists("generated_images"):
+            shutil.rmtree("generated_images")
         os.mkdir("generated_images")
 
     def on_epoch_end(self, epoch, logs=None):
@@ -368,9 +388,9 @@ if __name__ == "__main__":
         dcgan.load_weights(most_recent_ckpt_path)
 
     if True:
-        for n  in range(20):
+        for n in range(20):
             z_nice = dcgan.find_nice_latent_vectors(
-                num_nice_vectors=10, num_search_vectors=500
+                num_nice_vectors=20, num_search_vectors=512
             )
             a = z_nice[0, :]
             b = z_nice[1, :]
@@ -382,7 +402,74 @@ if __name__ == "__main__":
                 a_to_b[i, :] = a + p * (b - a)
             b_to_a = np.flipud(a_to_b)
             interp_loop = np.vstack([a_to_b, b_to_a])
-            dcgan.generate_and_save_images(interp_loop, "gifs/interp{n:03d}.gif".format(n=n), gif=True)
+            dcgan.generate_and_save_images(
+                interp_loop, "gifs/interp{n:03d}.gif".format(n=n), gif=True
+            )
+
+    if True:
+        zs = []
+        for i in range(9):
+            zs.append(
+                dcgan.find_nice_latent_vectors_for_num(
+                    num_nice_vectors=8 * 8, num_search_vectors=512, num=i
+                )
+            )
+
+        frames = []
+        frames_per_num = 32
+        for i in range(9):
+            za = zs[i]
+            zb = zs[int((i + 1) % 9)]
+            for f in range(frames_per_num):
+                p = f / (frames_per_num - 1)
+                z = za + p * (zb - za)
+                imgs = dcgan.generator(z)
+                imgs += 1.0
+                imgs /= 2.0
+                imgs.numpy()
+                frame = np.zeros((28 * 8, 28 * 8))
+                for n in range(8 * 8):
+                    x = int(int(n / 8) * 28)
+                    y = int(int(n % 8) * 28)
+                    frame[x : (x + 28), y : (y + 28)] = imgs[n, :, :, 0]
+                frames.append(frame)
+            for i in range(16):
+                frames.append(frames[-1])
+        while True:
+            for frame in frames:
+                cv2.imshow("image", frame)
+                cv2.waitKey(16)
+
+    if False:
+        z_nice = dcgan.find_nice_latent_vectors(
+            num_nice_vectors=2 * 8 * 8, num_search_vectors=512
+        )
+        z_a = z_nice[: 8 * 8, :]
+        z_b = z_nice[8 * 8 :, :]
+
+        num_frames = 20
+        frames = []
+        for f in range(num_frames):
+            p = f / (num_frames - 1)
+            z_interp = z_a + p * (z_b - z_a)
+            imgs = dcgan.generator(z_interp)
+            imgs += 1.0
+            imgs /= 2.0
+            imgs.numpy()
+            frame = np.zeros((28 * 8, 28 * 8))
+            for n in range(8 * 8):
+                i = int(int(n / 8) * 28)
+                j = int(int(n % 8) * 28)
+                print(i, j, n)
+                frame[i : (i + 28), j : (j + 28)] = imgs[n, :, :, 0]
+            frames.append(frame)
+        while True:
+            for i in range(num_frames):
+                cv2.imshow("image", frames[i])
+                cv2.waitKey(16)
+            for i in range(num_frames - 1, 0, -1):
+                cv2.imshow("image", frames[i])
+                cv2.waitKey(16)
 
     train = False
     if train:
